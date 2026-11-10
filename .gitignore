@@ -1,0 +1,37 @@
+# Terraform local state and working directories
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+crash.log
+crash.*.log
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.ovpn
+**/secrets/
+**/credentials/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# macOS and editor
+.DS_Store
+.vscode/setti.vscode/setti.vscode/setti.vscode/set*.log
+*.tmp
+*.bak
