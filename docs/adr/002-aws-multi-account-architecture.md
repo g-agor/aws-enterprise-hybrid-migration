@@ -1,139 +1,72 @@
-
 # ADR-002: AWS Multi-Account Architecture
-
-**Status:** Accepted  
-**Date:** 2026-11-10  
-**Project:** AWS Enterprise Hybrid Infrastructure & Migration
 
 ## Context
 
-The project demonstrates migration of an on-premises application and PostgreSQL database to AWS using an enterprise-style multi-account architecture.
+The hybrid migration architecture requires separation between organisational management, shared networking and application workloads.
 
-The design must enforce separation between centralised networking, workload infrastructure and management functions. It must also remain isolated from an existing AWS portfolio project.
-
-A single-account architecture would reduce deployment complexity but would not adequately demonstrate organisational governance, workload isolation or shared networking patterns.
+A multi-account design provides clearer infrastructure ownership, limits the potential impact of configuration errors and reflects enterprise AWS operating models.
 
 ## Decision
 
-Use three AWS accounts within AWS Organizations:
+Use three AWS accounts within AWS Organizations, with centralised networking managed independently of application workloads.
 
 | Account | Responsibility |
 |---|---|
-| Management | AWS Organizations, central billing and Terraform remote state |
-| Network | Transit Gateway, Site-to-Site VPN, Customer Gateway and shared network routing |
-| Development | Application VPC, private subnets and migration workloads |
+| Management | AWS Organizations, billing and Terraform remote state |
+| Network | Transit Gateway, Site-to-Site VPN and hybrid routing |
+| Development | VPC, private EC2 application and Amazon RDS PostgreSQL |
 
-The Network account owns the Transit Gateway and shares it with Development using AWS Resource Access Manager (RAM).
+The Network account owns the Transit Gateway and shares it with Development through AWS Resource Access Manager (RAM).
 
-The Development account attaches its VPC to the shared Transit Gateway.
+Development attaches its VPC to the shared Transit Gateway, providing private connectivity to the on-premises VMware environment.
 
-Terraform deployments are separated into account-specific root modules, with explicit AWS provider profiles and `allowed_account_ids`.
+Terraform uses account-specific deployment profiles, independent state and `allowed_account_ids` restrictions.
 
 ## Alternatives Considered
 
-### Option 1: Single AWS Account
-
-**Advantages**
-- Simpler deployment and IAM management
-- Fewer cross-account dependencies
-- Reduced operational overhead
-
-**Disadvantages**
-- Weaker account-level isolation
-- Larger blast radius
-- Less representative of enterprise environments
-
-**Decision:** Rejected.
-
-### Option 2: Multi-Account with Decentralised Networking
-
-Each workload account maintains its own hybrid connectivity.
-
-**Advantages**
-- Greater autonomy for workload teams
-- Independent network deployment cycles
-
-**Disadvantages**
-- Duplicated VPN connectivity
-- Increased network management complexity
-- More difficult centralised governance
-
-**Decision:** Rejected.
-
-### Option 3: Multi-Account with Centralised Networking
-
-A dedicated Network account provides shared connectivity through Transit Gateway.
-
-**Advantages**
-- Centralised network administration
-- Separation of networking and workloads
-- Scalable foundation for additional AWS accounts
-- Consistent hybrid routing architecture
-
-**Disadvantages**
-- Additional cross-account dependencies
-- More complex Terraform deployment sequence
-- Transit Gateway and VPN operating costs
-
-**Decision:** Selected.
-
-## Consequences
-
-### Positive
-
-- Clear account-level security and operational boundaries
-- Centralised management of hybrid connectivity
-- Separation of networking from application workloads
-- Supports adding future workload accounts
-- Independent Terraform state for Network and Development
-
-### Negative
-
-- AWS RAM configuration and cross-account attachment acceptance are required
-- Troubleshooting spans IAM, Organizations, RAM, VPC and Transit Gateway
-- Deployment order must account for cross-account dependencies
-- Shared network infrastructure incurs ongoing costs
+| Option | Decision | Rationale |
+|---|---|---|
+| Single AWS account | Rejected | Larger blast radius and weaker responsibility separation |
+| Multi-account with decentralised networking | Rejected | Duplicated VPN infrastructure and increased operational complexity |
+| Multi-account with centralised networking | Selected | Shared connectivity, clear ownership and scalable network architecture |
 
 ## Implementation
 
-The following have been deployed in `eu-west-2`:
+The architecture was deployed in `eu-west-2` and includes:
 
-- AWS Organizations Management, Network and Development accounts
-- S3-backed Terraform remote state
-- Transit Gateway in the Network account
-- Site-to-Site VPN attached to the Transit Gateway
-- RAM resource share restricted to the Organization
-- Development VPC (`10.30.0.0/16`)
-- Two private subnets in separate Availability Zones
-- Cross-account VPC attachment, confirmed `available`
-- Dedicated Transit Gateway route tables and VPC routes
+- Transit Gateway and Site-to-Site VPN in the Network account.
+- AWS RAM sharing and cross-account VPC attachment.
+- Static routing between `10.10.0.0/24` and `10.30.0.0/16`.
+- Two configured and independently tested IPsec tunnels.
+- Private application and database workloads in Development.
 
-The on-premises VMware network uses `10.10.0.0/24`.
+The on-premises strongSwan gateway provides VPN connectivity to AWS. Both tunnels support manual failover, which was tested successfully.
 
-The AWS-side networking has been provisioned, but the on-premises IPsec tunnels and end-to-end connectivity are not yet operational.
+The migrated Flask application runs on private EC2 and connects to Amazon RDS PostgreSQL without public internet exposure.
 
-## Security Considerations
+## Consequences
 
-- Apply account-specific IAM roles and temporary credentials.
-- Enforce account restrictions using Terraform `allowed_account_ids`.
-- Restrict RAM sharing to the AWS Organization.
-- Keep Terraform state, credentials and VPN secrets out of Git.
-- Apply least-privilege security group and firewall rules.
-- Review cost, operational ownership and change management for shared network services.
+**Benefits**
+
+- Clear separation of network and workload responsibilities.
+- Centralised hybrid connectivity.
+- Independent Terraform deployment boundaries.
+- Foundation for additional workload VPCs and accounts.
+
+**Trade-offs**
+
+- Cross-account dependencies increase deployment and troubleshooting complexity.
+- Shared networking introduces additional operating costs.
+- Static routing requires manual administration.
+- VPN tunnel failover is manual rather than automatic.
 
 ## Validation
 
-**Completed**
-- Verified account identities and Organization membership
-- Verified AWS RAM sharing
-- Confirmed Transit Gateway VPC attachment is `available`
-- Deployed Development private subnets and route tables
-
-**Pending**
-- Verify all effective route-table entries
-- Establish Site-to-Site VPN tunnels
-- Test end-to-end hybrid connectivity
-- Validate security controls and application migration
+- Cross-account Transit Gateway attachment operational.
+- Private routing between VMware and AWS established.
+- Both VPN tunnels tested independently.
+- On-premises access to private EC2 and RDS verified.
+- Flask application and PostgreSQL migration completed successfully.
 
 ## References
 

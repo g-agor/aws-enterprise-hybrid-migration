@@ -1,289 +1,83 @@
-
 # ADR-005: AWS Site-to-Site VPN versus Direct Connect
 
-**Status:** Accepted  
-**Date:** 2026-11-10  
-**Project:** AWS Enterprise Hybrid Infrastructure & Migration
+## Context
 
-## 1. Context
+The project requires secure hybrid connectivity between a physically separate VMware environment and AWS workloads in `eu-west-2`.
 
-The project requires hybrid connectivity between a physically separate on-premises VMware environment and an AWS Development VPC.
+The on-premises environment uses a residential internet connection with a strongSwan VPN gateway behind NAT. AWS hosts the migration workloads in private subnets connected to a centrally managed Transit Gateway.
 
-### On-premises environment
+The connectivity solution must support application migration, PostgreSQL data transfer and private workload access while balancing security, cost, reliability and operational complexity.
 
-- VMware Fusion running on an Intel MacBook Pro
-- Ubuntu application server: `10.10.0.10`
-- PostgreSQL database server: `10.10.0.20`
-- Ubuntu strongSwan VPN gateway: `10.10.0.2`
-- On-premises network: `10.10.0.0/24`
-- Internet connectivity through a residential router using NAT
+## Decision
 
-### AWS environment
+Use **AWS Site-to-Site VPN with IKEv2/IPsec**, terminating on the Transit Gateway in the Network account.
 
-- Region: `eu-west-2` (London)
-- Transit Gateway hosted in a dedicated Network account
-- Development VPC: `10.30.0.0/16`
-- Private workload subnets across two Availability Zones
+An Ubuntu strongSwan gateway (`10.10.0.2`) establishes encrypted tunnels through the residential router using NAT traversal.
 
-The solution must provide private-address communication between the two environments to support application migration, database migration, validation and cutover.
+The implementation uses:
 
-The design must also consider cost, operational complexity, reliability, security and future scalability.
+- Two AWS VPN tunnel endpoints.
+- IKEv2/IPsec with pre-shared key authentication.
+- UDP 500 and 4500 for IKE and NAT traversal.
+- Static routing between `10.10.0.0/24` and `10.30.0.0/16`.
+- Transit Gateway routing to private Development workloads.
 
-## 2. Decision
+Both tunnels have been configured and independently tested. Manual failover and restoration were demonstrated successfully.
 
-Use **AWS Site-to-Site VPN with IKEv2/IPsec** as the hybrid transport for the project.
+## Alternatives Considered
 
-Terminate the AWS VPN connection on the Transit Gateway and use strongSwan on the dedicated Ubuntu VPN gateway as the customer-side IPsec implementation.
+| Option | Decision | Rationale |
+|---|---|---|
+| Site-to-Site VPN | Selected | Encrypted connectivity over existing internet infrastructure at manageable cost |
+| AWS Direct Connect | Rejected | Dedicated connectivity and provider provisioning are disproportionate to the lab's requirements |
+| Direct Connect with VPN encryption | Rejected | Additional resilience and transport options, but unnecessary cost and complexity |
+| Simulated on-premises VPC | Rejected | Does not demonstrate real customer-gateway, NAT traversal and physical environment separation |
 
-The customer gateway operates behind a residential router with UDP 500 and UDP 4500 forwarded to the VPN VM.
+## Implementation
 
-Use NAT traversal (NAT-T) where required.
+The deployed architecture connects:
 
-The initial implementation uses static routing between:
+**VMware application/database servers → strongSwan gateway → Residential router → IPsec VPN → AWS Transit Gateway → Private Development VPC**
 
-- On-premises: `10.10.0.0/24`
-- AWS Development VPC: `10.30.0.0/16`
+The customer gateway operates behind NAT with UDP 500 and 4500 forwarded to the Ubuntu VPN VM.
 
-The AWS Site-to-Site VPN provides two tunnel endpoints.
+AWS-side routing is managed through dedicated Transit Gateway route tables, while on-premises hosts route AWS-bound traffic through the strongSwan gateway.
 
-Both tunnel configurations will be implemented and tested where supported by the on-premises gateway.
+VPN pre-shared keys are stored outside source control.
 
-## 3. Alternatives Considered
+The design uses static routes rather than BGP, and VPN tunnel failover requires manual intervention.
 
-### Option 1: AWS Site-to-Site VPN
+## Consequences
 
-**Advantages**
+**Benefits**
 
-- Uses the existing internet connection
-- Supports encrypted IPsec tunnels
-- Integrates with AWS Transit Gateway
-- No dedicated leased network circuit required
-- Suitable for a limited-duration hybrid migration lab
-- Demonstrates enterprise-relevant VPN and routing concepts
+- Secure connectivity between physically separate environments.
+- No dedicated network circuit or colocation infrastructure required.
+- Private access to AWS application and database workloads.
+- Practical experience with IPsec, NAT-T, customer gateways and hybrid routing.
+- Integration with centralised AWS networking.
 
-**Disadvantages**
+**Trade-offs**
 
-- Dependent on public internet performance and availability
-- Latency, jitter and bandwidth are less predictable
-- Residential public IPv4 may change
-- NAT and firewall configuration add troubleshooting complexity
-- VPN connection and Transit Gateway charges continue while provisioned
+- Dependent on residential internet availability and performance.
+- Public IPv4 changes can disrupt VPN connectivity.
+- Manual tunnel recovery introduces operational dependency.
+- VPN and Transit Gateway resources incur ongoing charges.
+- Less predictable throughput and latency than appropriately provisioned dedicated connectivity.
 
-**Outcome:** Selected.
+For enterprise production environments, Direct Connect or a combined Direct Connect/VPN design may be preferable where throughput, availability and operational requirements justify it.
 
-### Option 2: AWS Direct Connect
+## Validation
 
-**Advantages**
+- Both IKEv2/IPsec tunnels established successfully.
+- strongSwan security associations confirmed.
+- Manual tunnel switching and restoration tested.
+- Private routing between on-premises and AWS verified.
+- PostgreSQL migration completed over the VPN.
+- SSH and Flask API access to private AWS EC2 demonstrated.
 
-- Dedicated connectivity between customer networks and AWS
-- More predictable network performance than ordinary internet-based VPN
-- Available in multiple bandwidth and connectivity options
-- Supports connectivity through a Direct Connect gateway to appropriate AWS network targets
-- Suitable for sustained enterprise hybrid workloads
-
-**Disadvantages**
-
-- Requires physical connectivity through a Direct Connect location or connectivity provider
-- Longer provisioning and operational coordination
-- Port, provider and data transfer charges
-- Not economically or operationally appropriate for a small residential lab
-- Direct Connect traffic is not inherently IPsec-encrypted
-
-**Outcome:** Rejected for this implementation.
-
-### Option 3: Direct Connect with VPN Encryption
-
-Use Direct Connect as the private transport, with IPsec VPN or another supported encryption mechanism protecting traffic as required.
-
-**Advantages**
-
-- Combines more predictable private transport with encrypted connectivity
-- Suitable for regulated environments requiring additional confidentiality controls
-- Can form part of a resilient hybrid architecture
-
-**Disadvantages**
-
-- Higher cost and operational complexity
-- More demanding infrastructure prerequisites
-- Unnecessary for the scale of this lab
-
-**Outcome:** Not implemented; a potential enterprise extension.
-
-### Option 4: Simulated On-Premises Environment in AWS
-
-Host the source servers in another VPC and simulate migration across AWS networks.
-
-**Advantages**
-
-- Easier deployment
-- No residential router or NAT dependency
-- Fully cloud-based automation
-
-**Disadvantages**
-
-- Does not demonstrate physical separation between source and destination
-- Avoids real customer-gateway and internet-based VPN configuration
-- Less representative of an actual on-premises-to-cloud migration
-
-**Outcome:** Rejected.
-
-## 4. Selected Architecture
-
-```text
-ON-PREMISES / VMWARE FUSION
-
-Application VM      PostgreSQL VM
-10.10.0.10          10.10.0.20
-       \               /
-        \             /
-          10.10.0.0/24
-                |
-       strongSwan VPN Gateway
-           10.10.0.2
-                |
-       Residential Router / NAT
-                |
-           Public Internet
-                |
-         IKEv2 / IPsec VPN
-         Tunnel 1 / Tunnel 2
-                |
-AWS NETWORK ACCOUNT (eu-west-2)
-       AWS Site-to-Site VPN
-                |
-         Transit Gateway
-                |
-       AWS RAM Shared TGW
-                |
-AWS DEVELOPMENT ACCOUNT
-         VPC 10.30.0.0/16
-                |
-      Private Application and
-       Database Destinations
-```
-
-This diagram represents the intended connectivity design. The IPsec tunnels have not yet been established.
-
-## 5. VPN Design Considerations
-
-### 5.1 Tunnel Redundancy
-
-AWS provisions two VPN tunnel endpoints to support redundancy.
-
-Both tunnels must be configured and tested before claiming tunnel-level failover capability.
-
-The presence of two AWS tunnel endpoints alone does not demonstrate successful failover.
-
-### 5.2 NAT Traversal
-
-The Ubuntu strongSwan gateway is behind a residential router.
-
-UDP 500 is used for IKE negotiation, while UDP 4500 supports IPsec NAT traversal.
-
-Correct port forwarding, firewall rules, NAT behaviour and public IP configuration are required.
-
-### 5.3 Routing
-
-The VPN uses static routing for the initial implementation.
-
-AWS-side route tables are configured to forward traffic between the on-premises subnet and the Development VPC.
-
-On-premises hosts must also have appropriate return routes through the strongSwan gateway.
-
-### 5.4 Encryption and Secrets
-
-IKEv2/IPsec provides encrypted communication across the public internet.
-
-Pre-shared keys and tunnel parameters must be retrieved securely and stored outside version control.
-
-Tunnel secrets must not appear in public GitHub documentation, screenshots or Terraform outputs.
-
-### 5.5 Public IP Dependency
-
-The AWS Customer Gateway references the on-premises public IPv4 address.
-
-If the residential public address changes, VPN connectivity may fail until the customer-gateway configuration is updated.
-
-A production design should use appropriately managed connectivity endpoints and operational monitoring.
-
-## 6. Enterprise Production Considerations
-
-For a production migration, the connectivity decision should be based on:
-
-- Required migration throughput and data volume
-- Available migration window
-- Latency sensitivity
-- Reliability and availability requirements
-- Security and encryption requirements
-- Existing WAN and colocation infrastructure
-- Commercial lead times
-- Cost of connectivity and data transfer
-
-For sustained enterprise connectivity, Direct Connect may be preferable.
-
-Where resilience is important, an architecture may combine Direct Connect connections with VPN backup, subject to routing and failover design.
-
-The migration strategy should be validated against actual business requirements rather than assuming Direct Connect is always the superior option.
-
-## 7. Consequences
-
-### Positive
-
-- Physically separate source and destination environments
-- Real IPsec connectivity implementation
-- Integration with centralised AWS networking
-- Lower infrastructure commitment than Direct Connect
-- Demonstrates customer gateway, NAT-T, firewall and routing concepts
-- Supports end-to-end migration testing
-
-### Negative
-
-- Residential connectivity is not production-grade
-- Public IP changes can disrupt the tunnel
-- Internet performance is variable
-- VPN configuration and troubleshooting may be complex
-- Charges continue while AWS connectivity resources exist
-- End-to-end connectivity depends on correct on-premises routing
-
-## 8. Implementation Status
-
-**Completed**
-
-- Installed strongSwan on the Ubuntu VPN gateway
-- Enabled IP forwarding
-- Configured initial host firewall rules
-- Forwarded UDP 500 and 4500 on the residential router
-- Created AWS Customer Gateway
-- Created AWS Site-to-Site VPN connection
-- Attached the VPN to the Transit Gateway
-- Created AWS-side routing infrastructure
-
-**Pending**
-
-- Retrieve and securely configure both AWS tunnel specifications
-- Configure strongSwan connections and authentication
-- Bring up the IPsec tunnels
-- Verify tunnel status and negotiated security associations
-- Configure and validate on-premises return routes
-- Perform end-to-end application and database connectivity tests
-- Test tunnel failure and recovery
-
-## 9. Validation Criteria
-
-The implementation will be considered successful when:
-
-1. At least one IPsec tunnel is established.
-2. strongSwan reports an established IKE security association and CHILD_SA.
-3. AWS reports the corresponding tunnel as UP.
-4. On-premises and AWS private IP connectivity works in both directions, subject to workload firewalls.
-5. Application and database traffic can pass through the hybrid connection.
-6. Traffic remains confined to the intended network paths.
-7. Where both tunnels are configured, tunnel failover is tested and recorded.
-
-## 10. References
+## References
 
 - [AWS Site-to-Site VPN](https://docs.aws.amazon.com/vpn/latest/s2svpn/VPC_VPN.html)
-- [AWS Site-to-Site VPN Tunnel Options](https://docs.aws.amazon.com/vpn/latest/s2svpn/VPNTunnels.html)
 - [AWS Direct Connect](https://docs.aws.amazon.com/directconnect/latest/UserGuide/Welcome.html)
-- [AWS Direct Connect Gateway](https://docs.aws.amazon.com/directconnect/latest/UserGuide/direct-connect-gateways.html)
 - [strongSwan Documentation](https://docs.strongswan.org/)

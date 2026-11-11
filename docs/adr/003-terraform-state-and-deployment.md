@@ -1,208 +1,95 @@
-
 # ADR-003: Terraform State Management and Deployment Strategy
-
-**Status:** Accepted  
-**Date:** 2026-11-10  
-**Project:** AWS Enterprise Hybrid Infrastructure & Migration
 
 ## Context
 
-The project provisions infrastructure across multiple AWS accounts using Terraform.
+The hybrid migration project provisions infrastructure across multiple AWS accounts using Terraform. Secure state management is essential to prevent deployment conflicts, configuration drift and unintended changes to existing infrastructure.
 
-Terraform state records mappings between declared resources and deployed AWS infrastructure. Loss, corruption or concurrent modification of state could lead to configuration drift, failed deployments or unintended infrastructure changes.
-
-The project requires:
-
-- Account-specific infrastructure isolation
-- Secure and durable Terraform state storage
-- Concurrency protection during deployments
-- Reproducible Terraform provider versions
-- Temporary AWS credentials rather than static access keys
-- Recovery from partially completed deployments
-- Isolation from existing Project 2 infrastructure
+The architecture requires independent state, concurrency protection, controlled AWS credentials and a reliable approach to recovering from partial deployment failures.
 
 ## Decision
 
-Use separate Terraform root modules for Bootstrap, Network and Development.
+Use separate Terraform root modules for **Bootstrap, Network and Development**, with Network and Development state stored remotely in a dedicated, versioned Amazon S3 bucket.
 
-Store Network and Development state remotely in a versioned Amazon S3 bucket owned by the AWS Organizations Management account.
-
-Use native S3 state locking through Terraform's `use_lockfile = true` option.
-
-Retain the Bootstrap Terraform state locally because Bootstrap manages the S3 bucket used by the other environments.
-
-Use separate AWS provider profiles for each account, with `allowed_account_ids` enforcing deployment boundaries.
-
-### State Architecture
-
-| Root Module | State Location | AWS Account |
+| Environment | State location | AWS account |
 |---|---|---|
 | Bootstrap | Local Terraform state | Management |
-| Network | S3: `network/terraform.tfstate` | Network |
-| Development | S3: `development/terraform.tfstate` | Development |
+| Network | `network/terraform.tfstate` | Network |
+| Development | `development/terraform.tfstate` | Development |
 
 **State bucket:** `project3-hybrid-terraform-state-euw2`  
-**Bucket owner:** Management account (`297580067519`)  
-**AWS Region:** `eu-west-2`
+**Region:** `eu-west-2`
 
-The state bucket is configured with:
+The S3 backend implements:
 
-- S3 bucket versioning
-- Server-side encryption using SSE-S3 (AES-256)
-- Block Public Access
-- HTTPS-only access policy
-- Terraform `prevent_destroy` lifecycle protection
+- Versioning and SSE-S3 encryption.
+- Block Public Access and HTTPS-only access.
+- Native Terraform state locking using `use_lockfile = true`.
+- Terraform `prevent_destroy` protection for the bucket resource.
 
-The S3 backend uses the Management account's `T-Builder` profile.
+Terraform providers use account-specific profiles, temporary AWS credentials and `allowed_account_ids` restrictions. Provider dependency lock files are committed to Git.
 
-Terraform AWS providers use account-specific profiles to deploy resources into their respective workload accounts.
+The Bootstrap environment retains local state because it provisions the remote-state infrastructure.
 
 ## Alternatives Considered
 
-### Option 1: Local Terraform State for All Environments
+| Option | Decision | Rationale |
+|---|---|---|
+| Local state for all environments | Rejected | No shared locking and greater risk of state loss |
+| S3 with DynamoDB locking | Rejected | Additional infrastructure and deprecated locking mechanism |
+| S3 with native locking | Selected | Versioned remote state and concurrency protection without DynamoDB |
 
-**Advantages**
-- Simple initial setup
-- No remote backend dependency
-- Minimal infrastructure overhead
+## Deployment Strategy
 
-**Disadvantages**
-- State loss risk if the development machine fails
-- No built-in shared locking
-- Difficult team collaboration
-- Inappropriate for repeatable enterprise-style operations
+Infrastructure deployment follows account and resource dependencies:
 
-**Outcome:** Rejected for Network and Development.
+1. **Bootstrap:** Provision the S3 state backend in Management.
+2. **Network:** Deploy Transit Gateway, VPN and AWS RAM sharing.
+3. **Development:** Deploy the VPC, private subnets and TGW attachment.
+4. **Network:** Configure cross-account attachment routing.
+5. **Development:** Configure private routes and deploy migration workloads.
+6. **On-premises:** Establish VPN connectivity and complete workload migration.
 
-### Option 2: S3 Backend with DynamoDB Locking
+This sequence separates resource ownership while accommodating cross-account networking dependencies.
 
-**Advantages**
-- Established locking pattern
-- Familiar to many existing Terraform environments
+## Implementation and Recovery
 
-**Disadvantages**
-- Requires an additional DynamoDB table
-- Adds infrastructure and operational overhead
-- DynamoDB-based locking has been deprecated in newer Terraform versions
+Network and Development infrastructure were deployed successfully using separate remote-state configurations.
 
-**Outcome:** Rejected in favour of native S3 locking.
+During an earlier Network deployment, AWS RAM rejected two resource-share associations. Terraform preserved successfully deployed resources in state, allowing the remaining associations to be created through a fresh reconciliation plan.
 
-### Option 3: S3 Backend with Native Locking
+This demonstrated that Terraform operations are not atomic and that partial failures should be recovered through state inspection and replanning rather than deleting infrastructure or reusing outdated saved plans.
 
-**Advantages**
-- Secure, versioned remote state
-- Built-in concurrency protection
-- Fewer supporting AWS resources
-- Clear separation of environment state
-- Compatible with the chosen Terraform version
-
-**Disadvantages**
-- Depends on S3 availability and backend permissions
-- Requires careful cross-account credential management
-- Backend configuration must be maintained separately from the AWS provider
-
-**Outcome:** Selected.
-
-## Credential and Account Strategy
-
-AWS CLI profiles provide temporary credentials through STS AssumeRole.
-
-The following profiles are used:
-
-| Purpose | Profile |
-|---|---|
-| Management and S3 backend | `T-Builder` |
-| Network Terraform provider | `project3-network-terraform` |
-| Development Terraform provider | `project3-dev-terraform` |
-
-Terraform-compatible provider profiles use AWS CLI `credential_process` to export temporary credentials from the existing account-assumption profiles.
-
-No permanent AWS access keys are required in Terraform configuration.
-
-Provider-level `allowed_account_ids` restrict deployment to the intended AWS account.
-
-## Deployment Dependency Strategy
-
-The infrastructure is deployed in a controlled sequence:
-
-1. Bootstrap: create the remote-state bucket.
-2. Network: create Transit Gateway, route tables, VPN and RAM share.
-3. Development: create VPC, private subnets and TGW attachment.
-4. Network: accept the cross-account attachment and configure TGW routing.
-5. Development: enable routes from private subnets towards the on-premises LAN.
-6. On-premises: configure IPsec and validate hybrid connectivity.
-
-This order resolves dependencies between the account that owns the Transit Gateway and the account consuming the shared resource.
-
-## Recovery from Partial Deployment Failure
-
-During the Network deployment, AWS RAM rejected two resource-share associations with `OperationNotPermittedException`.
-
-Terraform successfully recorded the other deployed resources in remote state.
-
-The investigation verified AWS Organizations membership, trusted access, the RAM service-linked role, its permissions and the resource-share configuration.
-
-After RAM integration was established, a fresh Terraform reconciliation plan successfully created the two remaining associations.
-
-This demonstrated that:
-
-- Terraform applies are not atomic transactions.
-- Successfully created resources can remain deployed when other resources fail.
-- Remote state should be preserved during recovery.
-- A fresh plan should be generated after a partial deployment.
-- Saved plans must not be reused after infrastructure state changes.
-
-The deployed Transit Gateway and VPN were preserved throughout recovery.
-
-## Security Considerations
-
-- Never commit Terraform state or saved plan files.
-- Exclude `.tfvars`, environment files and credential material from version control.
-- Commit `.terraform.lock.hcl` to preserve dependency selections.
-- Restrict S3 backend access to authorised identities.
-- Use temporary STS credentials.
-- Avoid placing credentials and VPN pre-shared keys in Terraform output or documentation.
-- Protect the Bootstrap local state separately from the repository.
-- Review state bucket encryption and access controls before production use.
+The same controlled reconciliation approach was subsequently used when addressing Terraform routing configuration drift.
 
 ## Consequences
 
-### Positive
+**Benefits**
 
-- Isolated state for Network and Development
-- Centralised remote-state governance
-- Versioned state recovery capability
-- Terraform concurrency protection
-- Reproducible provider dependencies
-- Reduced risk of cross-account deployment errors
-- Documented recovery from partial infrastructure failures
+- Independent Network and Development state.
+- Centralised, encrypted and versioned state storage.
+- Concurrency protection without DynamoDB.
+- Reduced cross-account deployment risk.
+- Reproducible provider dependencies.
+- Recovery from partial deployment failures.
 
-### Negative
+**Trade-offs**
 
-- Additional backend and credential configuration
-- Dependency on the Management account for remote state
-- Local Bootstrap state requires separate protection
-- Cross-account deployments require carefully coordinated execution
+- Remote state depends on Management account availability and permissions.
+- Cross-account deployment requires coordinated configuration.
+- Bootstrap local state requires separate backup and protection.
+- S3 backend access and permissions require ongoing governance.
 
 ## Validation
 
-**Completed**
-- Created and verified the S3 state bucket
-- Confirmed S3 versioning, encryption and public access restrictions
-- Initialised Network and Development remote backends
-- Validated Terraform configurations
-- Deployed Network and Development infrastructure
-- Recovered successfully from a partial Network deployment
-- Committed Terraform configurations and provider lockfiles to Git
-
-**Pending**
-- Periodically review backend IAM permissions
-- Implement a protected backup procedure for Bootstrap local state
-- Document tested Terraform state-recovery procedures
+- Verified S3 backend encryption, versioning and access restrictions.
+- Initialised Network and Development remote state.
+- Successfully deployed Terraform-managed infrastructure across the accounts.
+- Recovered from partial deployment failures without destroying existing resources.
+- Maintained project-specific source control and provider dependency lock files.
 
 ## References
 
 - [Terraform S3 Backend](https://developer.hashicorp.com/terraform/language/backend/s3)
 - [Terraform State](https://developer.hashicorp.com/terraform/language/state)
 - [Terraform Dependency Lock File](https://developer.hashicorp.com/terraform/language/files/dependency-lock)
-- [AWS S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html)
+- [Amazon S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html)

@@ -1,270 +1,98 @@
-
 # ADR-004: AWS Transit Gateway Hub-and-Spoke Architecture
 
-**Status:** Accepted  
-**Date:** 2026-11-10  
-**Project:** AWS Enterprise Hybrid Infrastructure & Migration
+## Context
 
-## 1. Context
+The hybrid migration environment requires private, bidirectional connectivity between an on-premises VMware network and AWS workloads.
 
-The project requires private connectivity between an on-premises VMware environment and workloads hosted in AWS.
+The architecture must support centralised network management, cross-account connectivity, controlled routing and future workload expansion without duplicating VPN infrastructure.
 
-The on-premises environment contains:
+## Decision
 
-- Application server: `10.10.0.10`
-- PostgreSQL database server: `10.10.0.20`
-- strongSwan VPN gateway: `10.10.0.2`
-- On-premises LAN: `10.10.0.0/24`
+Deploy **AWS Transit Gateway in the Network account** as the central connectivity hub, with the Development VPC and Site-to-Site VPN connected as spokes.
 
-The AWS Development environment contains:
+The Transit Gateway operates in `eu-west-2` using ASN `64512` and is shared with the Development account through AWS Resource Access Manager (RAM).
 
-- VPC: `10.30.0.0/16`
-- Private subnet A: `10.30.0.0/24`
-- Private subnet B: `10.30.1.0/24`
+Routing uses dedicated Transit Gateway route tables, explicit attachment associations and static routes. Default route-table association and propagation are disabled.
 
-The architecture requires centralised hybrid connectivity, network isolation, controlled routing and support for additional workload accounts.
+### Network Architecture
 
-## 2. Decision
-
-Deploy an AWS Transit Gateway in a dedicated Network account in `eu-west-2`.
-
-Use a hub-and-spoke topology where:
-
-- The Transit Gateway acts as the central network hub.
-- The Development VPC connects as a spoke.
-- The Site-to-Site VPN connects the on-premises environment to the hub.
-- AWS RAM shares the Transit Gateway with the Development account.
-- Dedicated Transit Gateway route tables control traffic between attachments.
-
-The Transit Gateway uses Amazon ASN `64512`.
-
-Automatic default route-table association and propagation are disabled.
-
-Routing is configured explicitly through Terraform.
-
-## 3. Architecture
-
-```text
-             ON-PREMISES ENVIRONMENT
-                  10.10.0.0/24
-                        |
-                strongSwan Gateway
-                    10.10.0.2
-                        |
-                 Internet / IPsec
-                        |
-                  AWS VPN Connection
-                        |
-                NETWORK ACCOUNT
-                Transit Gateway
-                 ASN 64512
-                        |
-              +---------+---------+
-              |                   |
-        VPN TGW Route       Development TGW
-            Table             Route Table
-              |                   |
-        10.30.0.0/16          10.10.0.0/24
-        -> Dev VPC            -> VPN
-              |                   |
-              +---------+---------+
-                        |
-               Development VPC
-                  10.30.0.0/16
-                        |
-               Two private subnets
-```
-
-The diagram is a logical representation of routing relationships, not a depiction of physical network connections.
-
-## 4. Transit Gateway Routing Design
-
-Two dedicated Transit Gateway route tables provide explicit routing between the VPN and Development VPC attachments.
-
-### VPN Route Table
-
-Associated with the VPN attachment.
-
-| Destination | Target |
+| Component | Network |
 |---|---|
-| `10.30.0.0/16` | Development VPC attachment |
+| On-premises VMware LAN | `10.10.0.0/24` |
+| strongSwan VPN gateway | `10.10.0.2` |
+| Development VPC | `10.30.0.0/16` |
+| Private subnet A | `10.30.0.0/24` |
+| Private subnet B | `10.30.1.0/24` |
 
-Traffic arriving from on-premises is forwarded towards the Development VPC.
+The logical traffic path is:
 
-### Development Route Table
+**VMware network → strongSwan → AWS Site-to-Site VPN → Transit Gateway → Development VPC → Private workloads**
 
-Associated with the Development VPC attachment.
+### Routing Design
 
-| Destination | Target |
-|---|---|
-| `10.10.0.0/24` | VPN attachment |
+| Route table | Destination | Target |
+|---|---|---|
+| TGW VPN attachment | `10.30.0.0/16` | Development VPC attachment |
+| TGW Development attachment | `10.10.0.0/24` | VPN attachment |
+| Development private subnets | `10.10.0.0/24` | Transit Gateway |
 
-Traffic arriving from Development is forwarded towards the on-premises network.
+Separate route tables establish controlled bidirectional forwarding without allowing unrestricted routing between future workload spokes.
 
-### Development VPC Route Tables
+## Alternatives Considered
 
-Both private subnet route tables contain:
+| Option | Decision | Rationale |
+|---|---|---|
+| VPC peering | Rejected | No transitive routing and unsuitable as the central hybrid connectivity solution |
+| Direct VPC-attached VPN | Rejected | Simpler for one VPC but less scalable across workload accounts |
+| Transit Gateway hub-and-spoke | Selected | Centralised connectivity, cross-account sharing and route-table segmentation |
 
-| Destination | Target |
-|---|---|
-| `10.30.0.0/16` | Local VPC route |
-| `10.10.0.0/24` | Transit Gateway |
+## Implementation
 
-The Transit Gateway and VPC route tables work together to provide bidirectional forwarding.
+The architecture includes:
 
-Actual connectivity additionally depends on VPN tunnel establishment, on-premises routing, firewalls and workload security controls.
+- Transit Gateway deployed in the Network account.
+- Organisation-scoped AWS RAM resource sharing.
+- Cross-account Development VPC attachment.
+- Dedicated Transit Gateway route tables and static routes.
+- Private subnet routing towards the on-premises network.
+- Two configured strongSwan IPsec tunnels.
+- Application and PostgreSQL workloads hosted in private AWS subnets.
 
-## 5. Alternatives Considered
+Both VPN tunnels were independently tested, including manual tunnel switching and restoration.
 
-### Option 1: VPC Peering
+The Development VPC has no Internet Gateway or NAT Gateway, and its application and database resources are not publicly accessible.
 
-**Advantages**
-- Simple private connectivity between VPCs
-- No Transit Gateway required
+Routing controls are complemented by security groups and workload-level authentication.
 
-**Disadvantages**
-- Does not provide transitive routing
-- Less suitable for centralised connectivity across many VPCs
-- Does not directly replace a hybrid VPN transit architecture
+## Consequences
 
-**Outcome:** Rejected.
+**Benefits**
 
-### Option 2: Direct VPC-Attached Site-to-Site VPN
+- Centralised hybrid connectivity and network ownership.
+- Private communication between VMware and AWS.
+- Clear separation between networking and workload accounts.
+- Scalable foundation for additional VPC attachments.
+- Explicit route-table-based network segmentation.
 
-**Advantages**
-- Simpler for a single VPC
-- Fewer Transit Gateway dependencies
-- Potentially lower cost for a small deployment
+**Trade-offs**
 
-**Disadvantages**
-- Connectivity is tied to a particular VPC
-- Additional workload VPCs may require duplicated connectivity or a revised architecture
-- Less representative of centralised enterprise networking
+- Additional Transit Gateway and VPN operating costs.
+- Cross-account dependencies and more complex troubleshooting.
+- Static routes require controlled administration.
+- Shared Transit Gateway connectivity introduces a central dependency.
+- VPN tunnel failover is manual rather than automatic.
 
-**Outcome:** Rejected.
+## Validation
 
-### Option 3: Transit Gateway Hub-and-Spoke
+- Cross-account Transit Gateway attachment confirmed operational.
+- Static bidirectional routing established between `10.10.0.0/24` and `10.30.0.0/16`.
+- Both IPsec tunnels tested successfully.
+- Private EC2 access verified over the VPN.
+- PostgreSQL migration traffic successfully traversed the hybrid connection.
+- On-premises access to the migrated AWS Flask application demonstrated.
 
-**Advantages**
-- Centralises hybrid connectivity
-- Supports multiple AWS workload accounts and VPCs
-- Enables route-table-based network segmentation
-- Reduces the need to duplicate hybrid connectivity
-- Aligns with enterprise shared-network architectures
-
-**Disadvantages**
-- Additional complexity
-- Transit Gateway attachment and data-processing charges
-- Requires careful cross-account configuration
-- Introduces dependencies on central networking services
-
-**Outcome:** Selected.
-
-## 6. Routing and Segmentation Controls
-
-The design uses:
-
-- Dedicated Transit Gateway route tables
-- Explicit route-table associations
-- Static routes for known CIDR ranges
-- Disabled default association and propagation
-- Organisation-restricted AWS RAM sharing
-- Private workload subnets
-- Restrictive default security groups
-
-Dedicated route tables allow future workload spokes to have distinct routing policies.
-
-However, route-table separation alone is not a complete security boundary. Security groups, network ACLs, host firewalls and IAM controls remain necessary.
-
-## 7. Deployment Sequence
-
-The Transit Gateway infrastructure was deployed using Terraform in the following order:
-
-1. Create Transit Gateway in the Network account.
-2. Create dedicated Transit Gateway route tables.
-3. Create AWS RAM resource share.
-4. Associate Transit Gateway and Development account with the share.
-5. Create Development VPC and private subnets.
-6. Create cross-account Transit Gateway VPC attachment.
-7. Accept the attachment in the Network account.
-8. Associate the VPC attachment with its Transit Gateway route table.
-9. Configure static Transit Gateway routes.
-10. Add on-premises routes to Development private subnet route tables.
-
-The Development attachment was subsequently verified as `available`.
-
-## 8. Operational Considerations
-
-### Availability
-
-The Development attachment uses subnets in two Availability Zones.
-
-This provides multi-AZ attachment coverage, but does not independently guarantee application or database high availability.
-
-### Monitoring
-
-Operational monitoring should cover:
-
-- Transit Gateway attachment state
-- VPN tunnel availability
-- Routing configuration
-- Network traffic and throughput
-- CloudWatch metrics and alarms
-- Network connectivity and reachability
-
-### Cost
-
-Transit Gateway introduces ongoing charges for attachments and data processing.
-
-The Site-to-Site VPN also incurs recurring charges.
-
-The environment should be decommissioned or managed carefully when not in active use.
-
-### Change Management
-
-Routing changes should be reviewed through Terraform plans before deployment.
-
-Cross-account attachment changes must account for both Network and Development Terraform states.
-
-## 9. Consequences
-
-### Positive
-
-- Centralised AWS hybrid network architecture
-- Explicit routing between on-premises and AWS
-- Separation of workload and networking responsibilities
-- Scalable foundation for additional AWS accounts
-- Documented network segmentation controls
-
-### Negative
-
-- Increased operational complexity
-- Additional networking costs
-- Cross-account deployment dependencies
-- Potential central connectivity failure domain
-- Requirement for careful troubleshooting across multiple routing layers
-
-## 10. Validation
-
-**Completed**
-- Transit Gateway deployed in Network account
-- RAM sharing configured successfully
-- Development VPC attachment created and accepted
-- Attachment state confirmed as `available`
-- Dedicated TGW route tables deployed
-- Static AWS-side routing provisioned through Terraform
-
-**Pending**
-- Verify effective Transit Gateway route-table entries
-- Establish strongSwan IPsec tunnels
-- Verify on-premises return routes
-- Test bidirectional connectivity
-- Validate security controls and traffic restrictions
-- Capture operational evidence and metrics
-
-## 11. References
+## References
 
 - [AWS Transit Gateway](https://docs.aws.amazon.com/vpc/latest/tgw/what-is-transit-gateway.html)
 - [Transit Gateway Route Tables](https://docs.aws.amazon.com/vpc/latest/tgw/tgw-route-tables.html)
-- [Transit Gateway Attachments](https://docs.aws.amazon.com/vpc/latest/tgw/tgw-attachments.html)
 - [AWS Resource Access Manager](https://docs.aws.amazon.com/ram/latest/userguide/what-is.html)
